@@ -198,55 +198,77 @@ app.listen(PORT, () => {
 });
 
 // ---------------------------------------------------------------------------
-// Link health checker: every 3h, verify each store's retailer_url is alive.
-// Alive  -> refresh last_verified_at (keeps the entry visible & fresh)
-// Dead   -> confidence collapses to 0.05 (entry auto-hidden by decay logic)
-// "Dead" = HTTP >= 400, network error, or redirect landing on the homepage.
+// Availability checker v4 — FAIL-OPEN.
+// Verdicts per retailer_url, every 3h:
+//  'gone'        -> HTTP 404/410, or redirect to homepage  => hide entries
+//  'unavailable' -> page readable AND explicitly says out of stock => hide
+//  'unknown'     -> 403/429/5xx/timeout (bot-block etc.)   => DO NOTHING
+//  'available'   -> page readable, no out-of-stock marker  => refresh freshness
+// Rationale: a bot-block is not information about stock. Never hide on doubt.
 // ---------------------------------------------------------------------------
 const CHECK_INTERVAL_MS = 3 * 60 * 60 * 1000;
 
-async function checkOneLink(url) {
+const OUT_MARKERS = [
+  "schema.org/outofstock", "schema.org/discontinued", "schema.org/soldout",
+  '"availability":"outofstock"', "actuellement indisponible",
+  "produit indisponible", "n'est plus disponible", "n\u2019est plus disponible",
+  "article \u00e9puis\u00e9", "produit \u00e9puis\u00e9",
+];
+
+async function checkAvailability(url) {
   try {
     const res = await fetch(url, {
       redirect: "follow",
-      signal: AbortSignal.timeout(15000),
-      headers: { "User-Agent": "Mozilla/5.0 (compatible; ClimCloseLinkCheck/1.0)" },
+      signal: AbortSignal.timeout(20000),
+      headers: {
+        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/126.0 Safari/537.36",
+        "Accept-Language": "fr-FR,fr;q=0.9",
+      },
     });
-    if (!res.ok) return false;
+    if (res.status === 404 || res.status === 410) return "gone";
+    if (!res.ok) return "unknown"; // 403/429/5xx: likely bot-block, not stock info
     const finalPath = new URL(res.url).pathname;
-    if (finalPath === "/" || finalPath === "") return false; // bounced to homepage
-    return true;
+    if (finalPath === "/" || finalPath === "") return "gone";
+    const html = (await res.text()).slice(0, 800000).toLowerCase();
+    if (OUT_MARKERS.some((m) => html.includes(m))) return "unavailable";
+    return "available";
   } catch {
-    return false;
+    return "unknown"; // network error/timeout: no verdict
   }
 }
 
 async function checkAllLinks() {
   try {
     const { rows } = await pool.query("SELECT id, retailer_url FROM stores");
+    let hidden = 0, refreshed = 0, unknown = 0;
     for (const store of rows) {
-      const alive = await checkOneLink(store.retailer_url);
-      if (alive) {
+      const status = await checkAvailability(store.retailer_url);
+      if (status === "available") {
+        refreshed++;
         await pool.query(
           "UPDATE stock_entries SET last_verified_at = now() WHERE store_id = $1 AND confidence_score > 0.1",
           [store.id]
         );
-      } else {
+      } else if (status === "gone" || status === "unavailable") {
+        hidden++;
         await pool.query(
           "UPDATE stock_entries SET confidence_score = 0.05 WHERE store_id = $1",
           [store.id]
         );
-        console.warn(`Dead link, entries hidden: store ${store.id} -> ${store.retailer_url}`);
+        console.warn(`[link-check] ${status}: store ${store.id} -> ${store.retailer_url}`);
+      } else {
+        unknown++;
+        console.log(`[link-check] unknown (no action): store ${store.id}`);
       }
-      await new Promise((r) => setTimeout(r, 2000)); // be polite between requests
+      await new Promise((r) => setTimeout(r, 2500));
     }
-    console.log(`Link check done for ${rows.length} stores`);
+    console.log(`[link-check] done: ${refreshed} ok, ${hidden} hidden, ${unknown} unknown`);
   } catch (err) {
-    console.error("Link check failed:", err);
+    console.error("[link-check] failed:", err);
   }
 }
 
-setTimeout(checkAllLinks, 30 * 1000); // first pass 30s after boot
+setTimeout(checkAllLinks, 30 * 1000);
 setInterval(checkAllLinks, CHECK_INTERVAL_MS);
-moteur-v2-a-coller-1.txt
-Affichage de moteur-v2-a-coller-1.txt en cours...
+moteur-v4-a-coller-1.txt
+Affichage de moteur-v4-a-coller-1.txt en cours...

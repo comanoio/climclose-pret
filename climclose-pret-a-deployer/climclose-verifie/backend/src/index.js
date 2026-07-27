@@ -196,3 +196,57 @@ app.post("/api/alerts", async (req, res) => {
 app.listen(PORT, () => {
   console.log(`ClimClose backend listening on port ${PORT}`);
 });
+
+// ---------------------------------------------------------------------------
+// Link health checker: every 3h, verify each store's retailer_url is alive.
+// Alive  -> refresh last_verified_at (keeps the entry visible & fresh)
+// Dead   -> confidence collapses to 0.05 (entry auto-hidden by decay logic)
+// "Dead" = HTTP >= 400, network error, or redirect landing on the homepage.
+// ---------------------------------------------------------------------------
+const CHECK_INTERVAL_MS = 3 * 60 * 60 * 1000;
+
+async function checkOneLink(url) {
+  try {
+    const res = await fetch(url, {
+      redirect: "follow",
+      signal: AbortSignal.timeout(15000),
+      headers: { "User-Agent": "Mozilla/5.0 (compatible; ClimCloseLinkCheck/1.0)" },
+    });
+    if (!res.ok) return false;
+    const finalPath = new URL(res.url).pathname;
+    if (finalPath === "/" || finalPath === "") return false; // bounced to homepage
+    return true;
+  } catch {
+    return false;
+  }
+}
+
+async function checkAllLinks() {
+  try {
+    const { rows } = await pool.query("SELECT id, retailer_url FROM stores");
+    for (const store of rows) {
+      const alive = await checkOneLink(store.retailer_url);
+      if (alive) {
+        await pool.query(
+          "UPDATE stock_entries SET last_verified_at = now() WHERE store_id = $1 AND confidence_score > 0.1",
+          [store.id]
+        );
+      } else {
+        await pool.query(
+          "UPDATE stock_entries SET confidence_score = 0.05 WHERE store_id = $1",
+          [store.id]
+        );
+        console.warn(`Dead link, entries hidden: store ${store.id} -> ${store.retailer_url}`);
+      }
+      await new Promise((r) => setTimeout(r, 2000)); // be polite between requests
+    }
+    console.log(`Link check done for ${rows.length} stores`);
+  } catch (err) {
+    console.error("Link check failed:", err);
+  }
+}
+
+setTimeout(checkAllLinks, 30 * 1000); // first pass 30s after boot
+setInterval(checkAllLinks, CHECK_INTERVAL_MS);
+moteur-v2-a-coller-1.txt
+Affichage de moteur-v2-a-coller-1.txt en cours...
